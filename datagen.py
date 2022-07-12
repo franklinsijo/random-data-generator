@@ -19,9 +19,8 @@ class DataGen(object):
     ALLOWED_TYPES = ['TINYINT', 'SMALLINT', 'INT', 'BIGINT',
                      'FLOAT', 'DOUBLE', 'DECIMAL',
                      'VARCHAR', 'TEXT',
-                     'DATE', 'TIMESTAMP'
-                     ]
-    SIZE_PERFILE = 10 * 1024 * 1024  # 10 MB
+                     'DATE', 'TIMESTAMP']
+    SIZE_PER_FILE = 10 * 1024 * 1024  # 10 MB
     CONSTRAINTS = {
         'DECIMAL_PRECISION': 5,
         'DECIMAL_SCALE': 2,
@@ -51,7 +50,9 @@ class DataGen(object):
     def __init__(self, args):
         self.delimiter = args.DELIMITER
         if args.DELIMITER == 't': self.delimiter = '\t'
-
+                
+        self.num_records = args.NUM_RECORDS
+        self.use_size = False
         if args.SIZE:
             self.use_size = True
             try:
@@ -75,29 +76,15 @@ class DataGen(object):
                     raise Exception(
                         "Invalid Size Argument. Size argument must be of the pattern <digits><unit>. Ex: 1000G")
             self.size = int(round(self.size, -1))  # Rounding it to the nearest 10
-        else:
-            self.use_size = False
-            self.num_records = args.NUM_RECORDS
 
         self.num_columns = args.NUM_COLUMNS
 
         if args.NUM_FILES:
             self.num_files = args.NUM_FILES
-            if not self.use_size:
-                if self.num_records < 1001: self.num_files = 1
-            else:
-                if self.size < self.SIZE_PERFILE: self.num_files = 1
         else:
-            if not self.use_size:
-                if self.num_records < 1001:
-                    self.num_files = 1
-                else:
-                    self.num_files = self.num_records / 1000
-            else:
-                if self.size < self.SIZE_PERFILE:
-                    self.num_files = 1
-                else:
-                    self.num_files = self.size / self.SIZE_PERFILE
+            self.num_files = int(self.num_records / 100000) if self.num_records > 100000 else 1
+            if self.use_size:
+                self.num_files = int(self.size / self.SIZE_PER_FILE) if self.size > self.SIZE_PER_FILE else 1
 
         self.target_path = os.path.abspath(args.TARGET_PATH)
         self.file_prefix = args.FILE_PREFIX
@@ -107,26 +94,31 @@ class DataGen(object):
         if self.compression_enabled:
             self.file_suffix = self.file_suffix + '.gz'
 
-        self.HEADERS = ['field' + str(n) for n in xrange(1, self.num_columns + 1)]
-        self.FIELDLIST = self.get_fieldlist()
+        self.concurrency_enabled  = False
+        if args.NUM_THREADS:
+            self.concurrency_enabled = True
+            self.thread_count = args.NUM_THREADS
+
+        self.headers = ['field' + str(n) for n in range(1, self.num_columns + 1)]
+        self.field_list = self.get_fieldlist()
+        self.check_storage()
 
     def check_storage(self):
-        major_ver = sys.version_info[0]
-        if major_ver == 2:
-            stats = os.statvfs(self.target_path)
-            free_space = int(round(stats.f_bsize * stats.f_bavail, -1))
-            if self.SIZE > free_space:
-                raise Exception("Insufficient Space. Required: %d Bytes, Available: %d Bytes" % (self.SIZE, free_space))
-        elif major_ver == 3:
-            pass  # os.statvfs is not part of py3. Should add alternative logic
+        """
+        Pre-check the target directory for available free space and Write permissions
+        """
+        stats = os.statvfs(self.target_path)
+        free_space = int(round(stats.f_bsize * stats.f_bavail, -1))
+        if self.size > free_space:
+            raise Exception("Insufficient Space. Required: %d Bytes, Available: %d Bytes" % (self.size, free_space))
         try:
-            tmpfile = os.path.join(self.TARGET_PATH, 'datagen.tmp')
+            tmpfile = os.path.join(self.target_path, 'datagen.tmp')
             with open(tmpfile, 'w') as tfile:
                 tfile.write('Test File for Write Access')
             tfile.close()
             os.remove(tmpfile)
         except IOError:
-            raise Exception('Permission Denied: %s' % self.TARGET_PATH)
+            raise Exception('Permission Denied: %s' % self.target_path)
 
     def update_constraints(self, constraints):
         def integerize(i, key):
@@ -154,66 +146,78 @@ class DataGen(object):
             self.CONSTRAINTS[k.upper()] = v
 
     def get_fieldlist(self):
-        return [self.ALLOWED_TYPES[randint(0, len(self.ALLOWED_TYPES) - 1)] for _ in xrange(self.NUM_COLUMNS)]
+        return [self.ALLOWED_TYPES[randint(0, len(self.ALLOWED_TYPES) - 1)] for _ in range(self.num_columns)]
 
-    def write2file(self, fp, max_perfile):
+    def write2file(self, fp, max_per_file):        
         nrows_threshold = 100000
 
         def writer(nrows):
             rows = []
-            for row in xrange(nrows):
+            for _ in range(nrows):
                 rows.append([eval(self.FUNC[f]) for f in self.FIELDLIST])
-            if self.COMPRESSION_ENABLE:
+            if self.compression_enabled:
                 datafile = gzip.open(fp, 'ab')
             else:
                 datafile = open(fp, 'ab')
-            csvwriter = csv.writer(datafile, delimiter=self.DELIMITER)
+            csvwriter = csv.writer(datafile, delimiter=self.delimiter)
             csvwriter.writerows(rows)
             datafile.close()
 
-        if self.USE_SIZE:
+        if self.use_size:
+            """
+            When generating data based on a size limit, 
+            the resultant sum of the size of all files generated
+            will be equal to greater than the size requested.
+            """
             write_more = True
             while write_more:
                 writer(nrows_threshold)
                 fsize = os.path.getsize(fp)
-                if fsize >= max_perfile:
+                if fsize >= max_per_file:
                     write_more = False
         else:
-            while max_perfile:
-                if max_perfile > nrows_threshold:
+            while max_per_file:
+                if max_per_file > nrows_threshold:
                     writer(nrows_threshold)
-                    max_perfile = max_perfile - nrows_threshold
+                    max_per_file = max_per_file - nrows_threshold
                 else:
-                    writer(max_perfile)
-                    max_perfile = 0
+                    writer(max_per_file)
+                    max_per_file = 0
 
     def generate(self):
-        if self.USE_SIZE:
-            max_perfile = self.SIZE / self.NUM_FILES
+        # from pprint import pprint
+        # pprint(self.__dict__)
+        """
+        If the number of files is set by the user, 
+        per file limits, either in size or in record count
+        is set using this max_per_file parameter
+        """
+        if self.use_size:
+            max_per_file = int(self.size / self.num_files)
         else:
-            max_perfile = self.NUM_RECORDS / self.NUM_FILES
+            max_per_file = int(self.num_records / self.num_files)
 
-        if self.THREADING_ENABLE:
+        if self.concurrency_enabled:
             stop = 1
-            while self.NUM_FILES:
+            while self.num_files:
                 start = stop
-                if self.NUM_THREADS >= self.NUM_FILES:
-                    stop = stop + self.NUM_FILES
-                    self.NUM_FILES = 0
+                if self.thread_count >= self.num_files:
+                    stop = stop + self.num_files
+                    self.num_files = 0
                 else:
-                    stop = stop + self.NUM_THREADS
-                    self.NUM_FILES = self.NUM_FILES - self.NUM_THREADS
+                    stop = stop + self.thread_count
+                    self.num_files = self.num_files - self.thread_count
                 threads = []
-                print start, stop, self.NUM_FILES
-                for f in xrange(start, stop):
-                    fp = os.path.join(self.TARGET_PATH, self.FILE_PREFIX + str(f) + self.FILE_SUFFIX)
-                    threads.append(Thread(target=self.write2file, args=(fp, max_perfile,)))
+                print(start, stop, self.num_files)
+                for f in range(start, stop):
+                    fp = os.path.join(self.target_path, self.file_prefix + str(f) + self.file_suffix)
+                    threads.append(Thread(target=self.write2file, args=(fp, max_per_file,)))
                 [thread.start() for thread in threads]
                 [thread.join() for thread in threads]
         else:
-            for f in xrange(1, self.NUM_FILES + 1):
-                fp = os.path.join(self.TARGET_PATH, self.FILE_PREFIX + str(f) + self.FILE_SUFFIX)
-                self.write2file(fp, max_perfile)
+            for f in range(1, self.num_files + 1):
+                fp = os.path.join(self.target_path, self.file_prefix + str(f) + self.file_suffix)
+                self.write2file(fp, max_per_file)
 
 
 if __name__ == '__main__':
@@ -223,14 +227,14 @@ if __name__ == '__main__':
                            type=str,
                            default=",",
                            help="delimiter to separate the columns.")
-    argparser.add_argument("-s", "--size",
-                           dest="SIZE",
-                           help="total size of data to generate. Takes precedence over records parameter.")
     argparser.add_argument("-r", "--records",
                            dest="NUM_RECORDS",
                            type=int,
                            default=1000,
                            help="total number of records to generate. Will not be used if size parameter is specified.")
+    argparser.add_argument("-s", "--size",
+                           dest="SIZE",
+                           help="total size of data to generate. Takes precedence over records parameter.")                           
     argparser.add_argument("-c", "--columns",
                            dest="NUM_COLUMNS",
                            type=int,
@@ -240,7 +244,7 @@ if __name__ == '__main__':
                            dest="NUM_FILES",
                            type=int,
                            help="number of files to generate")
-    argparser.add_argument("--target-dir",
+    argparser.add_argument("-o", "--target-dir",
                            dest="TARGET_PATH",
                            default=os.path.dirname(__file__),
                            help="path to store the generated files")
@@ -255,9 +259,6 @@ if __name__ == '__main__':
     argparser.add_argument("--compress",
                            action="store_true",
                            help="Gzip compress the generated files")
-    argparser.add_argument("--threaded",
-                           action="store_true",
-                           help="run multiple threads")
     argparser.add_argument("-t", "--threads",
                            dest="NUM_THREADS",
                            type=int,
